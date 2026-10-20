@@ -1,0 +1,922 @@
+<!doctype html>
+<html lang="nl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Export uit kg.kunsten.be</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdfmake/0.2.10/pdfmake.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdfmake/0.2.10/vfs_fonts.min.js"></script>
+<style>
+  :root { --fg:#1d1d1f; --muted:#6b6b70; --line:#d9d9de; --bg:#fff; --accent:#0b5cad; --ok:#1d7a3a; --err:#b42318; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color:var(--fg); background:var(--bg); }
+  main { max-width:760px; margin:0 auto; padding:32px 16px 64px; }
+  h1 { font-size:1.6rem; margin:0 0 4px; }
+  p.lead { color:var(--muted); margin:0 0 24px; }
+  form { display:flex; gap:8px; flex-wrap:wrap; }
+  input[type=text] { flex:1 1 260px; font:inherit; padding:10px 12px; border:1px solid var(--line); border-radius:6px; }
+  button { font:inherit; padding:10px 18px; border:0; border-radius:6px; background:var(--accent); color:#fff; cursor:pointer; }
+  button:disabled { opacity:.5; cursor:default; }
+  .options { margin:12px 0 0; color:var(--muted); font-size:.92rem; }
+  .options label { margin-right:16px; }
+  #status { margin-top:28px; }
+  .bar { height:8px; background:#eee; border-radius:4px; overflow:hidden; margin:8px 0 12px; }
+  .bar > div { height:100%; width:0; background:var(--accent); transition:width .2s; }
+  ol#log { padding-left:20px; margin:0; font-size:.92rem; }
+  ol#log li.done { color:var(--ok); }
+  ol#log li.err { color:var(--err); }
+  #result { margin-top:24px; padding:16px; border:1px solid var(--line); border-radius:8px; display:none; }
+  #result h2 { margin:0 0 4px; font-size:1.2rem; }
+  #result table { border-collapse:collapse; margin:12px 0; font-size:.92rem; }
+  #result td { padding:2px 16px 2px 0; }
+  #result td:last-child { text-align:right; }
+  a { color:var(--accent); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Export uit kg.kunsten.be</h1>
+  <p class="lead">Vul het Q-nummer (of de link) in van een persoon of organisatie en klik op 'Exporteren'. Alle gegevens worden ingeladen en er wordt vervolgens een ZIP-bestand samengesteld met alle gegevens in JSON-formaat, de afbeeldingen, de bioteksten en een leesbaar PDF-bestand. Bij producties komt de speellijst (voorstelling, datum, locatie), bij muziekuitgaven de tracklist.</p>
+
+  <form id="form">
+    <input type="text" id="q" placeholder="bv. Q141532 of https://kg.kunsten.be/wiki/Item:Q141532" autocomplete="off" required>
+    <button id="go">Exporteren</button>
+  </form>
+  <div class="options">
+    <div><label><input type="checkbox" id="optImages" checked> Afbeeldingen downloaden</label></div>
+    <div><label><input type="checkbox" id="optPdf" checked> PDF-fiche genereren</label></div>
+    <div><label><input type="checkbox" id="optParts" checked> Speellijsten en tracklists</label></div>
+    <div><label><input type="checkbox" id="optResize" checked> Afbeeldingen verkleinen (max. 2000 px)</label></div>
+  </div>
+
+  <div id="status" hidden>
+    <div class="bar"><div id="bar"></div></div>
+    <ol id="log"></ol>
+  </div>
+
+  <div id="result"></div>
+</main>
+
+<script>
+'use strict';
+
+const KG = 'https://kg.kunsten.be';
+const API = KG + '/w/api.php';
+const SPARQL = KG + '/query/proxy/wdqs/bigdata/namespace/wdq/sparql';
+const IMGIX = 'https://kunstenpunt-datagids-wikibase.imgix.net';
+const LANGS = ['nl', 'en', 'fr', 'de'];
+const BATCH = 50;
+const PDF_THUMBS_MAX = 400;
+const RESIZE_MAX = 2000;
+const RESIZABLE = ['image/jpeg', 'image/png', 'image/webp'];
+
+const P = { IS: 'P1', BEGIN: 'P17', END: 'P18', ROLE: 'P15', ACTIVITY_TYPE: 'P13', WORK_TYPE: 'P48',
+            PLACE: 'P10', LOCATION: 'P62', BROUGHT_BY: 'P42', PART_OF: 'P43', MEDIA: 'P71', BIO: 'P78', LANG: 'P79',
+            NUMBER: 'P38', DURATION: 'P9' };
+
+// Onderdelen die met 'is onderdeel van' (P43) aan een productie of uitgave hangen.
+const PERFORMANCE = 'Voorstelling';
+const TRACK = 'Opname';
+
+// ---------- helpers ----------
+
+const $ = id => document.getElementById(id);
+
+function log(text, cls) {
+  const li = document.createElement('li');
+  li.textContent = text;
+  if (cls) li.className = cls;
+  $('log').appendChild(li);
+  return li;
+}
+
+function progress(fraction) {
+  $('bar').style.width = Math.round(Math.min(1, fraction) * 100) + '%';
+}
+
+function chunk(list, size) {
+  const out = [];
+  for (let i = 0; i < list.length; i += size) out.push(list.slice(i, i + size));
+  return out;
+}
+
+async function pool(items, limit, worker) {
+  const results = new Array(items.length);
+  let next = 0;
+  async function run() {
+    while (next < items.length) {
+      const i = next++;
+      results[i] = await worker(items[i], i);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, run));
+  return results;
+}
+
+async function fetchRetry(url, options = {}, tries = 4) {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      const res = await fetch(url, options);
+      if (res.ok) return res;
+      if (attempt >= tries || (res.status < 500 && res.status !== 429)) throw new Error(res.status + ' ' + url);
+    } catch (e) {
+      if (attempt >= tries) throw e;
+    }
+    await new Promise(r => setTimeout(r, 1000 * attempt));
+  }
+}
+
+async function api(params) {
+  const body = new URLSearchParams({ format: 'json', formatversion: '2', origin: '*', ...params });
+  const res = await fetchRetry(API, { method: 'POST', body });
+  const json = await res.json();
+  if (json.error) throw new Error(json.error.info || json.error.code);
+  return json;
+}
+
+async function sparql(query) {
+  const res = await fetchRetry(SPARQL, {
+    method: 'POST',
+    headers: { 'Accept': 'application/sparql-results+json', 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ query }),
+  });
+  return (await res.json()).results.bindings;
+}
+
+function parseId(input) {
+  const m = String(input).trim().match(/Q\d+/i) || String(input).trim().match(/^\d+$/);
+  if (!m) return null;
+  return m[0].toUpperCase().startsWith('Q') ? m[0].toUpperCase() : 'Q' + m[0];
+}
+
+function pick(map) {
+  if (!map) return null;
+  for (const l of LANGS) if (map[l]) return map[l].value;
+  const first = Object.values(map)[0];
+  return first ? first.value : null;
+}
+
+function slug(text) {
+  return String(text || '').normalize('NFD').replace(/[̀-ͯ]/g, '')
+    .toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 60) || 'export';
+}
+
+function formatTime(v) {
+  const m = v.time.match(/^([+-])(\d+)-(\d\d)-(\d\d)/);
+  if (!m) return v.time;
+  const year = (m[1] === '-' ? '-' : '') + String(Number(m[2]));
+  if (v.precision >= 11) return `${m[4]}/${m[3]}/${year}`;
+  if (v.precision === 10) return `${m[3]}/${year}`;
+  if (v.precision === 9) return year;
+  if (v.precision === 8) return year.slice(0, -1) + '0s';
+  return year;
+}
+
+// ---------- fetching ----------
+
+async function getEntities(ids, props, onBatch) {
+  const out = {};
+  const batches = chunk(ids, BATCH);
+  let done = 0;
+  await pool(batches, 4, async batch => {
+    const json = await api({ action: 'wbgetentities', ids: batch.join('|'), props, languages: LANGS.join('|') });
+    Object.assign(out, json.entities);
+    if (onBatch) onBatch(++done, batches.length);
+  });
+  return out;
+}
+
+async function getReferencingIds(id) {
+  const rows = await sparql(`SELECT DISTINCT ?s WHERE { ?s ?p <${KG}/entity/${id}> }`);
+  const ids = new Set();
+  for (const r of rows) {
+    const m = r.s.value.match(/\/entity\/(?:statement\/)?(Q\d+)/i);
+    if (m && m[1].toUpperCase() !== id) ids.add(m[1].toUpperCase());
+  }
+  return [...ids];
+}
+
+async function getPerformanceStats(ids) {
+  const out = {};
+  for (const batch of chunk(ids, 200)) {
+    const rows = await sparql(`SELECT ?item (COUNT(DISTINCT ?v) AS ?n) (COUNT(DISTINCT ?loc) AS ?locs) WHERE {
+      VALUES ?item { ${batch.map(i => `<${KG}/entity/${i}>`).join(' ')} }
+      ?v <${KG}/prop/direct/${P.PART_OF}> ?item .
+      OPTIONAL { ?v <${KG}/prop/direct/${P.LOCATION}> ?loc }
+    } GROUP BY ?item`);
+    for (const r of rows) {
+      out[r.item.value.split('/').pop()] = { count: Number(r.n.value), locations: Number(r.locs.value) };
+    }
+  }
+  return out;
+}
+
+async function getChildIds(ids) {
+  const out = {};
+  for (const batch of chunk(ids, 200)) {
+    const rows = await sparql(`SELECT ?item ?c WHERE {
+      VALUES ?item { ${batch.map(i => `<${KG}/entity/${i}>`).join(' ')} }
+      ?c <${KG}/prop/direct/${P.PART_OF}> ?item .
+    }`);
+    for (const r of rows) {
+      const parent = r.item.value.split('/').pop();
+      (out[parent] = out[parent] || []).push(r.c.value.split('/').pop());
+    }
+  }
+  return out;
+}
+
+async function getImageInfo(files, onBatch) {
+  const out = {};
+  const batches = chunk(files, BATCH);
+  let done = 0;
+  await pool(batches, 3, async batch => {
+    const json = await api({ action: 'query', prop: 'imageinfo', iiprop: 'url|size|mime',
+                             titles: batch.map(f => 'Bestand:' + f).join('|') });
+    const normalized = {};
+    for (const n of json.query.normalized || []) normalized[n.to] = n.from;
+    for (const page of json.query.pages) {
+      const title = normalized[page.title] || page.title;
+      const file = title.replace(/^Bestand:/, '');
+      const info = page.imageinfo && page.imageinfo[0];
+      if (info) out[file] = { url: info.url.replace(KG, IMGIX), width: info.width, height: info.height, size: info.size, mime: info.mime };
+    }
+    if (onBatch) onBatch(++done, batches.length);
+  });
+  return out;
+}
+
+async function getBio(url) {
+  const page = decodeURIComponent(url.replace(/^.*\/wiki\//, '')).replace(/_/g, ' ');
+  const json = await api({ action: 'parse', page, prop: 'text|wikitext' });
+  const doc = new DOMParser().parseFromString(json.parse.text, 'text/html');
+  doc.querySelectorAll('style, script, .mw-editsection').forEach(n => n.remove());
+  doc.querySelectorAll('div, p, br, li, h1, h2, h3, h4').forEach(n => n.append('\n'));
+  const text = doc.body.textContent.replace(/ /g, ' ').replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+  return { page, url, text, wikitext: json.parse.wikitext };
+}
+
+// ---------- normalising ----------
+
+function snakValue(snak, labels) {
+  if (snak.snaktype !== 'value') return { value: null, special: snak.snaktype === 'novalue' ? 'geen waarde' : 'onbekend' };
+  const dv = snak.datavalue;
+  switch (dv.type) {
+    case 'wikibase-entityid': return { value: dv.value.id, label: labels[dv.value.id] || dv.value.id };
+    case 'time': return { value: formatTime(dv.value), raw: dv.value.time, precision: dv.value.precision };
+    case 'monolingualtext': return { value: dv.value.text, language: dv.value.language };
+    case 'quantity': return { value: dv.value.amount.replace(/^\+/, ''), unit: dv.value.unit === '1' ? null : dv.value.unit };
+    case 'globecoordinate': return { value: `${dv.value.latitude}, ${dv.value.longitude}`, latitude: dv.value.latitude, longitude: dv.value.longitude };
+    default: return { value: dv.value };
+  }
+}
+
+function normalize(entity, labels, files) {
+  const claims = [];
+  for (const [prop, statements] of Object.entries(entity.claims || {})) {
+    for (const st of statements) {
+      const v = snakValue(st.mainsnak, labels);
+      const claim = { property: prop, propertyLabel: labels[prop] || prop, datatype: st.mainsnak.datatype, rank: st.rank, ...v };
+      if (st.mainsnak.datatype === 'localMedia' && v.value) {
+        const f = files[v.value];
+        claim.file = f && f.zipPath ? f.zipPath : null;
+        claim.fileUrl = f ? f.url : null;
+      }
+      const qualifiers = [];
+      for (const [qp, snaks] of Object.entries(st.qualifiers || {})) {
+        for (const s of snaks) qualifiers.push({ property: qp, propertyLabel: labels[qp] || qp, ...snakValue(s, labels) });
+      }
+      if (qualifiers.length) claim.qualifiers = qualifiers;
+      claims.push(claim);
+    }
+  }
+  return {
+    id: entity.id,
+    url: `${KG}/wiki/Item:${entity.id}`,
+    label: pick(entity.labels) || entity.id,
+    description: pick(entity.descriptions),
+    labels: Object.fromEntries(Object.entries(entity.labels || {}).map(([l, v]) => [l, v.value])),
+    descriptions: Object.fromEntries(Object.entries(entity.descriptions || {}).map(([l, v]) => [l, v.value])),
+    aliases: Object.fromEntries(Object.entries(entity.aliases || {}).map(([l, v]) => [l, v.map(a => a.value)])),
+    claims,
+  };
+}
+
+function collectIds(entity, into) {
+  for (const [prop, statements] of Object.entries(entity.claims || {})) {
+    into.add(prop);
+    for (const st of statements) {
+      const snaks = [st.mainsnak, ...Object.values(st.qualifiers || {}).flat()];
+      for (const s of snaks) {
+        into.add(s.property);
+        if (s.snaktype === 'value' && s.datavalue.type === 'wikibase-entityid') into.add(s.datavalue.value.id);
+      }
+    }
+  }
+}
+
+function collectFiles(entity, into) {
+  for (const st of (entity.claims || {})[P.MEDIA] || []) {
+    if (st.mainsnak.snaktype === 'value') into.add(st.mainsnak.datavalue.value);
+  }
+}
+
+function relationTo(item, rootId) {
+  const out = [];
+  for (const c of item.claims) {
+    if (c.value === rootId) {
+      out.push({ property: c.property, propertyLabel: c.propertyLabel,
+                 roles: (c.qualifiers || []).filter(q => q.property === P.ROLE).map(q => q.label || q.value) });
+    }
+    for (const q of c.qualifiers || []) {
+      if (q.value === rootId) out.push({ property: c.property, propertyLabel: c.propertyLabel, qualifier: q.property, qualifierLabel: q.propertyLabel, value: c.value, valueLabel: c.label || c.value });
+    }
+  }
+  return out;
+}
+
+function normalizePart(entity, parentId, labels, files, venueRaw) {
+  const part = normalize(entity, labels, files);
+  const link = ((entity.claims || {})[P.PART_OF] || [])
+    .find(st => st.mainsnak.snaktype === 'value' && st.mainsnak.datavalue.value.id === parentId);
+  const nr = link && ((link.qualifiers || {})[P.NUMBER] || []).find(s => s.snaktype === 'value');
+  if (nr) {
+    // Meestal 1, 2, 3 …, bij vinyl ook A1, B2 …
+    const v = String(typeof nr.datavalue.value === 'object' ? nr.datavalue.value.amount : nr.datavalue.value).replace(/^\+/, '').trim();
+    part.trackNumber = /^\d+$/.test(v) ? Number(v) : (v || null);
+  }
+  const venueId = firstValueId(part, P.LOCATION);
+  const venue = venueId && venueRaw[venueId];
+  const placeSt = venue && ((venue.claims || {})[P.PLACE] || []).find(st => st.mainsnak.snaktype === 'value');
+  part.venue = venueId ? { id: venueId, label: labels[venueId] || venueId } : null;
+  part.place = firstValue(part, P.PLACE) || (placeSt ? labels[placeSt.mainsnak.datavalue.value.id] || null : null);
+  const duration = claimValues(part, P.DURATION)[0];
+  part.duration = duration ? formatDuration(duration.value) : null;
+  return part;
+}
+
+function firstValueId(item, prop) {
+  const c = claimValues(item, prop)[0];
+  return c ? c.value : null;
+}
+
+function keyName(name) {
+  return String(name).normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '');
+}
+
+function simpleItem(item, rootId, labelsEn) {
+  const out = { id: item.id, name: item.label };
+  if (item.description) out.description = item.description;
+  out.kg = item.url;
+  const add = (key, value) => {
+    if (value === null || value === undefined || value === '') return;
+    if (!(key in out)) out[key] = value;
+    else if (Array.isArray(out[key])) { if (!out[key].includes(value)) out[key].push(value); }
+    else if (out[key] !== value) out[key] = [out[key], value];
+  };
+  for (const c of item.claims) {
+    if (c.rank === 'deprecated' || c.property === P.BIO) continue;
+    if (c.property === P.BROUGHT_BY) {
+      if (c.value === rootId) continue;
+      const roles = (c.qualifiers || []).filter(q => q.property === P.ROLE).map(q => q.label || q.value);
+      out.credits = out.credits || [];
+      const existing = out.credits.find(x => x.name === (c.label || c.value));
+      if (existing) roles.forEach(r => existing.roles.includes(r) || existing.roles.push(r));
+      else out.credits.push({ name: c.label || c.value, roles });
+      continue;
+    }
+    if (c.property === P.MEDIA) { add('images', c.file || c.fileUrl); continue; }
+    add(keyName(labelsEn[c.property] || c.propertyLabel), c.label || c.value || c.special);
+  }
+  if (out.images && !Array.isArray(out.images)) out.images = [out.images];
+  return out;
+}
+
+function simplePart(p, rootId) {
+  const out = { id: p.id };
+  if (p.trackNumber != null) out.track_number = p.trackNumber;
+  out.name = p.label;
+  const type = itemType(p);
+  if (type !== PERFORMANCE && type !== TRACK) out.type = type;
+  const date = dateRange(p);
+  if (date) out.date = date;
+  if (p.venue) out.venue = p.venue.label;
+  if (p.place) out.place = p.place;
+  if (p.duration) out.duration = p.duration;
+  const by = [];
+  for (const c of claimValues(p, P.BROUGHT_BY)) {
+    if (c.value === rootId) continue;
+    const roles = (c.qualifiers || []).filter(q => q.property === P.ROLE).map(q => q.label || q.value);
+    const name = c.label || c.value;
+    const existing = by.find(x => x.name === name);
+    if (existing) roles.forEach(r => existing.roles.includes(r) || existing.roles.push(r));
+    else by.push({ name, roles });
+  }
+  if (by.length) out.credits = by.map(b => b.roles.length ? b : { name: b.name });
+  out.kg = p.url;
+  return out;
+}
+
+function simpleData(data, labelsEn) {
+  const rootId = data.item.id;
+  const exported = new Set(data.referencedBy.map(i => i.id));
+  const root = simpleItem(data.item, rootId, labelsEn);
+  for (const bio of data.bios) {
+    root.biography = root.biography || {};
+    root.biography[keyName(bio.languageEn || bio.language || bio.page)] = bio.text;
+  }
+  const ownParts = new Set((data.item.parts || []).map(p => p.id));
+  if (ownParts.size) {
+    const key = { Speellijst: 'performances', Tracklist: 'tracks' }[partsTitle(data.item.parts)] || 'parts';
+    root[key] = data.item.parts.map(p => simplePart(p, rootId));
+  }
+  root.referenced_by = data.referencedBy
+    .filter(i => !ownParts.has(i.id) && !claimValues(i, P.PART_OF).some(c => exported.has(c.value)))
+    .sort((a, b) => dateKey(a).localeCompare(dateKey(b)) || a.label.localeCompare(b.label))
+    .map(i => {
+      const s = simpleItem(i, rootId, labelsEn);
+      const roles = [...new Set(i.relation.flatMap(r => r.roles))];
+      const simple = { id: s.id, name: s.name, type: itemType(i) };
+      if (roles.length) simple.roles = roles;
+      if (i.parts && i.parts.length) {
+        const key = { Speellijst: 'performances', Tracklist: 'tracks' }[partsTitle(i.parts)] || 'parts';
+        simple[key] = i.parts.map(p => simplePart(p, rootId));
+      } else if (i.performances) {
+        simple.performances = { count: i.performances.count, locations: i.performances.locations };
+      }
+      return { ...simple, ...s };
+    });
+  return {
+    source: data.source,
+    exported_at: formatDate(new Date(data.exportedAt)),
+    note: 'Simplified version. All details (Q-ids, ranks, qualifiers, full records of every performance and track) are in data.json.',
+    ...root,
+  };
+}
+
+async function blobToDataUrl(blob) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(r.result);
+    r.onerror = reject;
+    r.readAsDataURL(blob);
+  });
+}
+
+async function thumb(url, size) {
+  try {
+    const res = await fetchRetry(`${url}?w=${size}&h=${size}&fit=max&fm=jpg&q=65`, {}, 2);
+    return await blobToDataUrl(await res.blob());
+  } catch (e) {
+    return null;
+  }
+}
+
+// ---------- PDF ----------
+
+function claimValues(item, prop) {
+  return item.claims.filter(c => c.property === prop && c.rank !== 'deprecated');
+}
+
+function firstValue(item, prop) {
+  const c = claimValues(item, prop)[0];
+  return c ? (c.label || c.value) : null;
+}
+
+function itemType(item) {
+  return firstValue(item, P.ACTIVITY_TYPE) || firstValue(item, P.WORK_TYPE) || firstValue(item, P.IS) || 'Overige';
+}
+
+function dateKey(item) {
+  const c = claimValues(item, P.BEGIN)[0];
+  return c && c.raw ? c.raw : '';
+}
+
+function formatDate(d) {
+  return `${String(d.getDate()).padStart(2, '0')}/${String(d.getMonth() + 1).padStart(2, '0')}/${d.getFullYear()}`;
+}
+
+function dateRange(item) {
+  const b = firstValue(item, P.BEGIN), e = firstValue(item, P.END);
+  if (b && e && b !== e) return `${b} – ${e}`;
+  return b || e || '';
+}
+
+function formatDuration(seconds) {
+  const s = Math.round(Number(seconds));
+  if (!s) return '';
+  const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), r = String(s % 60).padStart(2, '0');
+  return h ? `${h}:${String(m).padStart(2, '0')}:${r}` : `${m}:${r}`;
+}
+
+function partsTitle(parts) {
+  const types = new Set(parts.map(itemType));
+  if (types.size === 1 && types.has(PERFORMANCE)) return 'Speellijst';
+  if (types.size === 1 && types.has(TRACK)) return 'Tracklist';
+  return 'Onderdelen';
+}
+
+function sortParts(parts) {
+  return parts.sort((a, b) =>
+    (a.trackNumber == null) - (b.trackNumber == null)
+    || String(a.trackNumber ?? '').localeCompare(String(b.trackNumber ?? ''), undefined, { numeric: true })
+    || dateKey(a).localeCompare(dateKey(b))
+    || a.label.localeCompare(b.label));
+}
+
+function preferredImage(item) {
+  const media = claimValues(item, P.MEDIA).filter(c => c.fileUrl);
+  return media.find(c => c.rank === 'preferred') || media[0] || null;
+}
+
+function claimLine(c) {
+  let text = c.label || c.value || c.special || '';
+  if (c.language) text += ` (${c.language})`;
+  const quals = (c.qualifiers || []).map(q => `${q.propertyLabel}: ${q.label || q.value || q.special}`);
+  return quals.length ? [{ text }, { text: '  ' + quals.join(' · '), color: '#666', fontSize: 8 }] : text;
+}
+
+function factsTable(item, skip = []) {
+  const byProp = new Map();
+  for (const c of item.claims) {
+    if (skip.includes(c.property) || c.rank === 'deprecated') continue;
+    if (!byProp.has(c.property)) byProp.set(c.property, { label: c.propertyLabel, values: [] });
+    byProp.get(c.property).values.push(claimLine(c));
+  }
+  if (!byProp.size) return null;
+  return {
+    table: { widths: [110, '*'], body: [...byProp.values()].map(r => [
+      { text: r.label, color: '#555' },
+      { stack: r.values.map(v => Array.isArray(v) ? { text: v } : { text: v }) },
+    ]) },
+    layout: 'lightHorizontalLines', fontSize: 9, margin: [0, 4, 0, 12],
+  };
+}
+
+function creditsText(item, rootId) {
+  const byAgent = new Map();
+  for (const c of claimValues(item, P.BROUGHT_BY)) {
+    if (c.value === rootId) continue;
+    if (!byAgent.has(c.value)) byAgent.set(c.value, { name: c.label || c.value, roles: new Set() });
+    (c.qualifiers || []).filter(q => q.property === P.ROLE).forEach(q => byAgent.get(c.value).roles.add(q.label || q.value));
+  }
+  const credits = [...byAgent.values()];
+  if (!credits.length) return null;
+  const shown = credits.slice(0, 15).map(a => a.name + (a.roles.size ? ` (${[...a.roles].join(', ')})` : ''));
+  if (credits.length > 15) shown.push(`en ${credits.length - 15} anderen`);
+  return shown.join(' · ');
+}
+
+function partsTable(parts, rootId, heading = true) {
+  const title = partsTitle(parts);
+  const head = cells => cells.map(t => ({ text: t, bold: true, color: '#555' }));
+  let widths, body;
+  if (title === 'Tracklist') {
+    widths = [18, 140, 34, '*'];
+    body = [head(['#', 'Titel', 'Duur', 'Credits']), ...parts.map(p => [
+      p.trackNumber ?? '', { text: p.label, link: p.url }, p.duration || '', creditsText(p, rootId) || '',
+    ])];
+  } else {
+    const presenter = p => claimValues(p, P.BROUGHT_BY).filter(c => c.value !== rootId).map(c => c.label || c.value);
+    widths = [52, '*', 70, 110];
+    body = [head(['Datum', 'Locatie', 'Plaats', 'Gebracht door']), ...parts.map(p => [
+      dateRange(p), p.venue ? p.venue.label : (title === 'Speellijst' ? '' : { text: p.label, link: p.url }),
+      p.place || '', [...new Set(presenter(p))].join(', '),
+    ])];
+  }
+  return { stack: [
+    ...(heading ? [{ text: `${title} (${parts.length})`, fontSize: 8.5, bold: true, margin: [0, 0, 0, 2] }] : []),
+    { table: { headerRows: 1, widths, body }, layout: 'lightHorizontalLines', fontSize: 7.5 },
+  ], margin: [0, 0, 0, 10] };
+}
+
+async function buildPdf(data, setStatus) {
+  const root = data.item;
+  const rootId = root.id;
+  const content = [];
+
+  content.push({ text: root.label, style: 'title' });
+  if (root.description) content.push({ text: root.description, color: '#555', margin: [0, 0, 0, 2] });
+  content.push({ text: [{ text: root.url, link: root.url, color: '#0b5cad' }, `  ·  export van ${formatDate(new Date(data.exportedAt))}`], fontSize: 8, color: '#777', margin: [0, 0, 0, 12] });
+
+  const rootImages = claimValues(root, P.MEDIA).filter(c => c.fileUrl).slice(0, 6);
+  if (rootImages.length) {
+    const imgs = await Promise.all(rootImages.map(c => thumb(c.fileUrl, 600)));
+    content.push({ columns: imgs.filter(Boolean).map(src => ({ image: src, fit: [160, 160] })), columnGap: 8, margin: [0, 0, 0, 12] });
+  }
+
+  const facts = factsTable(root, [P.MEDIA, P.BIO]);
+  if (facts) content.push({ text: 'Gegevens', style: 'h2' }, facts);
+
+  // Een geëxporteerde uitgave of productie: haar eigen tracklist of speellijst.
+  if (root.parts && root.parts.length) {
+    content.push({ text: `${partsTitle(root.parts)} (${root.parts.length})`, style: 'h2' }, partsTable(root.parts, rootId, false));
+  }
+  const ownParts = new Set((root.parts || []).map(p => p.id));
+
+  content.push({ toc: { title: { text: 'Inhoud', style: 'h2' }, textStyle: { fontSize: 10 }, numberStyle: { fontSize: 10 } } });
+
+  data.bios.forEach((bio, n) => {
+    content.push({ text: `Biografie (${bio.language || bio.page})`, style: 'h2', tocItem: true, id: `bio-${n}`, pageBreak: n === 0 ? 'before' : undefined });
+    content.push({ text: bio.text, fontSize: 9.5, margin: [0, 0, 0, 12], lineHeight: 1.25 });
+  });
+
+  const exported = new Set(data.referencedBy.map(i => i.id));
+  const groups = new Map();
+  for (const item of data.referencedBy) {
+    if (ownParts.has(item.id) || claimValues(item, P.PART_OF).some(c => exported.has(c.value))) continue;
+    const type = itemType(item);
+    if (!groups.has(type)) groups.set(type, []);
+    groups.get(type).push(item);
+  }
+  const order =[...groups.keys()].sort((a, b) =>
+    (a === PERFORMANCE) - (b === PERFORMANCE) || groups.get(b).length - groups.get(a).length || a.localeCompare(b));
+
+  const thumbs = {};
+  const wanted = [...groups.values()].flat().map(i => [i.id, preferredImage(i)]).filter(([, c]) => c);
+  if (data.options.images && wanted.length <= PDF_THUMBS_MAX) {
+    let done = 0;
+    await pool(wanted, 6, async ([id, c]) => {
+      thumbs[id] = await thumb(c.fileUrl, 240);
+      setStatus(++done / Math.max(1, wanted.length));
+    });
+  }
+
+  order.forEach((type, n) => {
+    const items = groups.get(type).slice().sort((a, b) => dateKey(a).localeCompare(dateKey(b)) || a.label.localeCompare(b.label));
+    content.push({ text: `${type} (${items.length})`, style: 'h2', pageBreak: 'before', tocItem: true, id: `section-${n}` });
+
+    if (type === PERFORMANCE) {
+      content.push({ text: `De fiche van ${root.label} verwijst ook naar de volgende voorstellingen, maar de producties in kwestie hebben géén verwijzing naar ${root.label}. Daarom vermelden we ze hier nog even apart.`,
+                     fontSize: 9, italics: true, color: '#555', margin: [0, 0, 0, 8] });
+      const rows = items.map(i => [
+        dateRange(i), { text: i.label, link: i.url }, firstValue(i, P.LOCATION) || '', firstValue(i, P.PLACE) || '',
+      ]);
+      content.push({ table: { headerRows: 1, widths: [60, '*', 120, 70], body: [
+        ['Datum', 'Titel', 'Locatie', 'Plaats'].map(t => ({ text: t, bold: true })), ...rows] },
+        layout: 'lightHorizontalLines', fontSize: 8 });
+      return;
+    }
+
+    for (const i of items) {
+      const roles = i.relation.flatMap(r => r.roles);
+      const via = [...new Set(i.relation.map(r => r.qualifierLabel ? `${r.propertyLabel} → ${r.qualifierLabel}` : r.propertyLabel))];
+      const lines = [
+        { text: [{ text: i.label, bold: true, link: i.url }, { text: '  ' + i.id, color: '#999', fontSize: 7 }] },
+        { text: [dateRange(i), firstValue(i, P.LOCATION), firstValue(i, P.PLACE)].filter(Boolean).join(' · '), color: '#555', fontSize: 8.5 },
+        { text: roles.length ? `Rol: ${[...new Set(roles)].join(', ')}` : `Verwijst via: ${via.join(', ')}`, fontSize: 8.5 },
+      ];
+      if (i.performances && !(i.parts && i.parts.length)) {
+        const { count, locations } = i.performances;
+        lines.push({ text: locations
+          ? `${count} ${count === 1 ? 'voorstelling' : 'voorstellingen'} op ${locations} ${locations === 1 ? 'locatie' : 'locaties'}`
+          : `${count} ${count === 1 ? 'onderdeel' : 'onderdelen'}`, fontSize: 8.5 });
+      }
+      const credits = creditsText(i, rootId);
+      if (credits) lines.push({ text: credits, fontSize: 7.5, color: '#666' });
+      const block = thumbs[i.id]
+        ? { columns: [{ image: thumbs[i.id], fit: [70, 70], width: 78 }, { stack: lines }], columnGap: 6 }
+        : { stack: lines };
+      content.push({ ...block, margin: [0, 0, 0, i.parts && i.parts.length ? 4 : 8], unbreakable: true });
+      if (i.parts && i.parts.length) content.push(partsTable(i.parts, rootId));
+    }
+  });
+
+  const doc = {
+    pageSize: 'A4', pageMargins: [40, 40, 40, 44], content,
+    defaultStyle: { fontSize: 10 },
+    styles: { title: { fontSize: 20, bold: true }, h2: { fontSize: 13, bold: true, margin: [0, 8, 0, 6] } },
+    footer: (page, pages) => ({ text: `${root.label} · kg.kunsten.be · ${page}/${pages}`, alignment: 'center', fontSize: 7, color: '#999' }),
+    info: { title: root.label, creator: 'kg.kunsten.be export' },
+  };
+  return new Promise(resolve => pdfMake.createPdf(doc).getBlob(resolve));
+}
+
+async function exportItem(id, options) {
+  const zip = new JSZip();
+  const stepWeights = { fetch: 0.35, images: options.images ? 0.4 : 0, pdf: options.pdf ? 0.15 : 0, zip: 0.1 };
+  const total = Object.values(stepWeights).reduce((a, b) => a + b, 0);
+  let base = 0;
+  const step = (name, f) => progress((base + stepWeights[name] * f) / total);
+  const finish = name => { base += stepWeights[name]; progress(base / total); };
+
+  let li = log(`Item ${id} ophalen…`);
+  const rootRaw = (await getEntities([id], 'labels|descriptions|aliases|claims'))[id];
+  if (!rootRaw || rootRaw.missing !== undefined) throw new Error(`${id} bestaat niet op kg.kunsten.be.`);
+  li.textContent = `Item ${id}: ${pick(rootRaw.labels) || id}`; li.className = 'done';
+
+  li = log('Alles zoeken dat naar dit item verwijst…');
+  const refIds = await getReferencingIds(id);
+  li.textContent = `${refIds.length} items verwijzen naar dit item.`; li.className = 'done';
+
+  li = log('Die items ophalen…');
+  const refRaw = await getEntities(refIds, 'labels|descriptions|aliases|claims', (d, n) => {
+    li.textContent = `Die items ophalen… ${d}/${n}`; step('fetch', 0.6 * d / n);
+  });
+  li.textContent = `${refIds.length} items opgehaald.`; li.className = 'done';
+
+  let performanceStats = {};
+  let childIds = {};
+  const childRaw = {};
+  const venueRaw = {};
+  // Exporteer je zelf een uitgave of productie, dan zijn haar tracks of
+  // voorstellingen gewoon items die ernaar verwijzen (is onderdeel van).
+  const rootChildIds = options.parts
+    ? refIds.filter(c => refRaw[c] && ((refRaw[c].claims || {})[P.PART_OF] || [])
+        .some(st => st.mainsnak.snaktype === 'value' && st.mainsnak.datavalue.value.id === id))
+    : [];
+  if (options.parts) {
+    li = log('Speellijsten en tracklists zoeken…');
+    childIds = await getChildIds(refIds);
+    const wanted = [...new Set(Object.values(childIds).flat())];
+    const missing = wanted.filter(c => !refRaw[c]);
+    li.textContent = `${wanted.length} voorstellingen, tracks en andere onderdelen gevonden bij ${Object.keys(childIds).length} items. Ophalen…`;
+    Object.assign(childRaw, await getEntities(missing, 'labels|descriptions|claims', (d, n) => {
+      li.textContent = `${wanted.length} onderdelen ophalen… ${d}/${n}`;
+    }));
+    wanted.filter(c => refRaw[c]).forEach(c => { childRaw[c] = refRaw[c]; });
+
+    // De stad van een voorstelling staat op de locatie zelf (locatie → plaats).
+    const venues = new Set();
+    for (const e of [...Object.values(childRaw), ...rootChildIds.map(c => refRaw[c])]) {
+      for (const st of (e.claims || {})[P.LOCATION] || []) {
+        if (st.mainsnak.snaktype === 'value') venues.add(st.mainsnak.datavalue.value.id);
+      }
+    }
+    if (venues.size) Object.assign(venueRaw, await getEntities([...venues], 'labels|claims'));
+    li.textContent = `${wanted.length} onderdelen opgehaald (${venues.size} locaties).`; li.className = 'done';
+
+    for (const [parent, children] of Object.entries(childIds)) {
+      const locs = new Set(children.flatMap(c => ((childRaw[c] || {}).claims || {})[P.LOCATION] || [])
+        .filter(st => st.mainsnak.snaktype === 'value').map(st => st.mainsnak.datavalue.value.id));
+      performanceStats[parent] = { count: children.length, locations: locs.size };
+    }
+  } else {
+    li = log('Voorstellingen en locaties per productie tellen…');
+    performanceStats = await getPerformanceStats(refIds);
+    li.textContent = `Voorstellingen geteld voor ${Object.keys(performanceStats).length} producties.`; li.className = 'done';
+  }
+
+  const all = [rootRaw, ...refIds.map(r => refRaw[r]).filter(Boolean)];
+  const children = Object.values(childRaw).filter(e => e && e.missing === undefined && !refRaw[e.id]);
+  const ids = new Set();
+  [...all, ...children].forEach(e => collectIds(e, ids));
+  for (const v of Object.values(venueRaw)) {
+    ((v.claims || {})[P.PLACE] || []).filter(st => st.mainsnak.snaktype === 'value').forEach(st => ids.add(st.mainsnak.datavalue.value.id));
+  }
+  [...all, ...children].forEach(e => ids.delete(e.id));
+  const labels = {};
+  [...all, ...children].forEach(e => { labels[e.id] = pick(e.labels) || e.id; });
+
+  li = log('Namen van eigenschappen en verwezen items ophalen…');
+  const labelRaw = await getEntities([...ids], 'labels', (d, n) => {
+    li.textContent = `Namen ophalen… ${d}/${n}`; step('fetch', 0.6 + 0.3 * d / n);
+  });
+  const labelsEn = {};
+  for (const [k, e] of Object.entries(labelRaw)) {
+    labels[k] = pick(e.labels) || k;
+    if (e.labels && e.labels.en) labelsEn[k] = e.labels.en.value;
+  }
+  li.textContent = `${ids.size} namen opgehaald.`; li.className = 'done';
+
+  const bios = [];
+  for (const st of (rootRaw.claims || {})[P.BIO] || []) {
+    if (st.mainsnak.snaktype !== 'value') continue;
+    try {
+      const bio = await getBio(st.mainsnak.datavalue.value);
+      const lang = ((st.qualifiers || {})[P.LANG] || [])[0];
+      bio.language = lang && lang.datavalue ? (labels[lang.datavalue.value.id] || lang.datavalue.value.id) : null;
+      bio.languageEn = lang && lang.datavalue ? labelsEn[lang.datavalue.value.id] || null : null;
+      bios.push(bio);
+    } catch (e) {
+      log(`Biotekst ${st.mainsnak.datavalue.value} niet gevonden.`, 'err');
+    }
+  }
+  if (bios.length) log(`${bios.length} biotekst(en) opgehaald.`, 'done');
+
+  const fileNames = new Set();
+  all.forEach(e => collectFiles(e, fileNames));
+  li = log(`Gegevens van ${fileNames.size} afbeeldingen ophalen…`);
+  const files = fileNames.size ? await getImageInfo([...fileNames], (d, n) => step('fetch', 0.9 + 0.1 * d / n)) : {};
+  li.textContent = `${Object.keys(files).length} afbeeldingen gevonden.`; li.className = 'done';
+  finish('fetch');
+
+  const folder = `kg-${id}-${slug(pick(rootRaw.labels))}`;
+  if (options.images && Object.keys(files).length) {
+    const list = Object.entries(files);
+    const totalMb = list.reduce((s, [, f]) => s + (f.size || 0), 0) / 1048576;
+    li = log(options.resize ? `afbeeldingen downloaden (origineel ${totalMb.toFixed(1)} MB, verkleind tot max. ${RESIZE_MAX} px)…`
+                            : `afbeeldingen downloaden (${totalMb.toFixed(1)} MB)…`);
+    let done = 0, failed = 0, bytes = 0;
+    await pool(list, 6, async ([name, f]) => {
+      try {
+        const resize = options.resize && RESIZABLE.includes(f.mime) && Math.max(f.width || 0, f.height || 0) > RESIZE_MAX;
+        const res = await fetchRetry(resize ? `${f.url}?w=${RESIZE_MAX}&h=${RESIZE_MAX}&fit=max&q=85` : f.url);
+        const blob = await res.blob();
+        zip.file(`${folder}/afbeeldingen/${name}`, blob, { binary: true, compression: 'STORE' });
+        f.zipPath = `afbeeldingen/${name}`;
+        f.resized = resize;
+        f.zipSize = blob.size;
+        bytes += blob.size;
+      } catch (e) {
+        failed++;
+      }
+      done++;
+      li.textContent = `afbeeldingen downloaden… ${done}/${list.length}`;
+      step('images', done / list.length);
+    });
+    li.textContent = `${list.length - failed} afbeeldingen gedownload (${(bytes / 1048576).toFixed(1)} MB)` + (failed ? `, ${failed} mislukt.` : '.');
+    li.className = failed ? 'err' : 'done';
+  }
+  finish('images');
+
+  const item = normalize(rootRaw, labels, files);
+  if (rootChildIds.length) item.parts = sortParts(rootChildIds.map(c => normalizePart(refRaw[c], id, labels, files, venueRaw)));
+  const referencedBy = refIds.map(r => refRaw[r]).filter(Boolean).map(e => {
+    const n = normalize(e, labels, files);
+    n.relation = relationTo(n, id);
+    if (performanceStats[n.id]) n.performances = performanceStats[n.id];
+    if (childIds[n.id]) n.parts = sortParts(childIds[n.id].map(c => childRaw[c]).filter(e => e && e.missing === undefined)
+      .map(e => normalizePart(e, n.id, labels, files, venueRaw)));
+    return n;
+  });
+
+  const data = {
+    source: KG,
+    exportedAt: new Date().toISOString(),
+    options,
+    item,
+    referencedBy,
+    bios,
+    files: Object.entries(files).map(([name, f]) => ({ name, path: f.zipPath || null, url: f.url, width: f.width, height: f.height, size: f.size, mime: f.mime,
+                                                      resized: !!f.resized, sizeInZip: f.zipSize ?? null })),
+  };
+  zip.file(`${folder}/data.json`, JSON.stringify(data, null, 2));
+  zip.file(`${folder}/data_simplified.json`, JSON.stringify(simpleData(data, labelsEn), null, 2));
+  for (const bio of bios) {
+    zip.file(`${folder}/bio-${slug(bio.language || bio.page)}.txt`, bio.text);
+  }
+
+  if (options.pdf) {
+    li = log('PDF-fiche maken…');
+    const pdf = await buildPdf(data, f => step('pdf', f * 0.8));
+    zip.file(`${folder}/fiche.pdf`, pdf, { binary: true });
+    li.textContent = 'PDF-fiche gemaakt.'; li.className = 'done';
+  }
+  finish('pdf');
+
+  li = log('ZIP maken…');
+  const blob = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE', compressionOptions: { level: 6 } },
+                                      m => step('zip', m.percent / 100));
+  li.textContent = `ZIP klaar (${(blob.size / 1048576).toFixed(1)} MB).`; li.className = 'done';
+  finish('zip');
+
+  return { blob, name: folder + '.zip', data };
+}
+
+function showResult({ blob, name, data }) {
+  const url = URL.createObjectURL(blob);
+  const types = {};
+  for (const i of data.referencedBy) { const t = itemType(i); types[t] = (types[t] || 0) + 1; }
+  const rows = Object.entries(types).sort((a, b) => b[1] - a[1]).map(([t, n]) => `<tr><td>${escapeHtml(t)}</td><td>${n}</td></tr>`).join('');
+  $('result').innerHTML = `
+    <h2>${escapeHtml(data.item.label)}</h2>
+    <div><a href="${data.item.url}" target="_blank" rel="noopener">${data.item.id}</a></div>
+    <table>${rows}</table>
+    <a id="dl" href="${url}" download="${name}"><button type="button">Download ${escapeHtml(name)} (${(blob.size / 1048576).toFixed(1)} MB)</button></a>`;
+  $('result').style.display = 'block';
+  $('dl').click();
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+$('form').addEventListener('submit', async e => {
+  e.preventDefault();
+  const id = parseId($('q').value);
+  if (!id) { $('status').hidden = false; $('log').innerHTML = ''; log('Geef een Q-nummer, bv. Q141532.', 'err'); return; }
+  history.replaceState(null, '', '?q=' + id);
+  $('go').disabled = true;
+  $('log').innerHTML = '';
+  $('result').style.display = 'none';
+  $('status').hidden = false;
+  progress(0);
+  try {
+    showResult(await exportItem(id, { images: $('optImages').checked, pdf: $('optPdf').checked,
+                                      parts: $('optParts').checked, resize: $('optResize').checked }));
+  } catch (err) {
+    console.error(err);
+    log('Fout: ' + err.message, 'err');
+  } finally {
+    $('go').disabled = false;
+  }
+});
+
+const initial = new URLSearchParams(location.search).get('q');
+if (initial) $('q').value = parseId(initial) || initial;
+</script>
+</body>
+</html>
